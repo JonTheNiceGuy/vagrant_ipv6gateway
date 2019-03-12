@@ -1,0 +1,292 @@
+---
+# This stanza based on https://gist.github.com/gwillem/4ba393dceb55e5ae276a87300f6b8e6f
+- hosts: all
+  become: true
+  gather_facts: False
+  
+  tasks:
+  - name: install python 2
+    raw: test -e /usr/bin/python || (apt -y update && apt install -y python-minimal)
+    register: output
+    changed_when: output.stdout != ""
+
+- hosts: all
+  become: true
+  vars:
+    interfaces:
+      he-ipv6:
+        tunnel:
+          endpoint: "198.51.100.100" # Get this from the tunnelbroker.net site
+          localpoint: "192.168.1.253" # This is YOUR IP as set in the Vagrantfile
+        ipv6:
+          prefix: "2001:db8:123c:abd:"
+          suffix: 2
+          gateway: 1
+          mask: 64
+          default_route: true
+      enp0s3: # Mgmt Host  # WARNING - DO NOT TOUCH THIS BLOCK!
+        ipv4:              # ##################################
+          prefix: "10.0.2" # This is the Vagrant defaults for the NAT-only interface
+          suffix: 15       # Mess with this block, and you can't do Vagrant SSH
+          mask: 24         # or Vagrant Provision any more!!
+      enp0s8: # Wired Host for IPv4 DHCP and DNS resolution
+        dhcp:
+          ipv4:
+            dns: true
+            pool_start: 110
+            pool_end: 210
+          ipv6:
+            dns: true
+        ipv4:
+          prefix: "192.168.1"
+          suffix: 253                   # This is your IPv4 address as defined in
+          mask: 24                      #   the VagrantFile
+          gateway: 254                  # And your default gateway for your network
+          default_route: true
+          DNS:
+          - 8.8.8.8                     # Google's DNS servers
+          - 8.8.4.4
+        ipv6:
+          prefix: "2001:db8:123d:abc:" # This is your IPv6 routed prefix from Tunnelbroker.net
+          suffix: 1
+          mask: "64"
+          DNS:
+          - 2001:4860:4860::8888       # More Google's DNS servers
+          - 2001:4860:4860::8844       # Just because, why not, eh!?
+  handlers:
+  - name: Restart systemd-networkd
+    systemd:
+      state: restarted
+      name: systemd-networkd
+  - name: Re-Apply Netplan
+    shell: netplan apply
+  - name: Reload UFW
+    ufw:
+      state: reloaded
+  - name: Restart DNSMasq
+    systemd:
+      state: restarted
+      name: dnsmasq.service
+  tasks:
+  # SSH
+
+  - name: Import the Vagrant SSH Key
+    raw: ssh-keygen -y -f /vagrant/.vagrant/machines/ipv6gateway/virtualbox/private_key
+    register: vagrant_ssh_key
+  - name: Create .ssh
+    file:
+      dest: "{{ item.path }}/.ssh"
+      owner: "{{ item.user }}"
+      group: "{{ item.user }}"
+      state: directory
+      mode: 0700
+    loop:
+    - {path: /root, user: root}
+    - {path: /home/vagrant, user: vagrant}
+  - name: Copy the .ssh/authorized_keys in
+    copy:
+      dest: "{{ item.path }}/.ssh/authorized_keys"
+      content: |
+          {{ vagrant_ssh_key.stdout }}  
+          {% include('authorized_keys') %}
+      owner: "{{ item.user }}"
+      group: "{{ item.user }}"
+      mode: 0600
+    loop:
+    - {path: /root, user: root}
+    - {path: /home/vagrant, user: vagrant}
+
+  # ROUTER
+
+  - name: Set us up to be a router
+    sysctl:
+      name: "{{ item.name }}"
+      value: "{{ item.value }}"
+      state: "present"
+    loop:
+    - {name: net.ipv4.conf.default.rp_filter, value: 1}
+    - {name: net.ipv4.conf.all.rp_filter, value: 1}
+    - {name: net.ipv4.ip_forward, value: 1}
+    - {name: net.ipv6.conf.all.forwarding, value: 1}
+
+  # Until otherwise mentioned, some parts based on https://askubuntu.com/a/992872
+  # Also https://wiki.archlinux.org/index.php/IPv6_tunnel_broker_setup#systemd-networkd
+  - name: Ensure the vagrant netplan file is not present
+    file:
+      state: absent
+      dest: "{{ item }}"
+    loop:
+    - /etc/netplan/50-vagrant.yaml
+    - /etc/netplan/50-cloud-init.yaml
+    notify:
+    - Restart systemd-networkd
+    - Re-Apply Netplan
+  - name: Create SystemD Network Specs
+    copy:
+      content: |
+          [Match]
+          Name={{ item.key }}
+          [Network]
+          {% if item.value.ipv6 is defined %}
+          Address={{ item.value.ipv6.prefix }}:{{ item.value.ipv6.suffix }}/{{ item.value.ipv6.mask|default(64) }}
+          {% if item.value.ipv6.gateway is defined %}
+          Gateway={{ item.value.ipv6.prefix }}:{{ item.value.ipv6.gateway }}
+          {% endif %}
+          {% for dns in item.value.ipv6.dns|default([]) %}
+          DNS={{ dns }}
+          {% endfor %}
+          {% endif %}
+          {% if item.value.ipv4 is defined %}
+          Address={{ item.value.ipv4.prefix }}.{{ item.value.ipv4.suffix }}/{{ item.value.ipv4.mask|default(24) }}
+          {% if item.value.ipv4.gateway is defined %}
+          Gateway={{ item.value.ipv4.prefix }}.{{ item.value.ipv4.gateway }}
+          {% endif %}
+          {% for dns in item.value.ipv4.dns|default([]) %}
+          DNS={{ dns }}
+          {% endfor %}
+          {% endif %}
+      dest: "/etc/systemd/network/{{ item.key }}.network"
+      mode: 0644
+      owner: root
+      group: root
+    loop: "{{ interfaces|dict2items }}"
+    loop_control:
+      label: "{{ item.key }}"
+    notify:
+    - Restart systemd-networkd
+  - name: Create SystemD NetDev
+    copy:
+      content: |
+          [Match]
+          [NetDev]
+          Name={{ item.key }}
+          Kind=sit
+          MTUBytes={{ item.value.tunnel.mtu|default(1480) }}
+          [Tunnel]
+          Independent=true
+          Local={{ item.value.tunnel.localpoint }}
+          Remote={{ item.value.tunnel.endpoint }}
+          TTL={{ item.value.tunnel.ttl|default(255) }}
+      dest: "/etc/systemd/network/{{ item.key }}.netdev"
+      mode: 0644
+      owner: root
+      group: root
+    loop: "{{ interfaces|dict2items }}"
+    loop_control:
+      label: "{{ item.key }}"
+    when: item.value.tunnel is defined
+    notify:
+    - Restart systemd-networkd
+
+  - apt:
+      name: ufw
+      state: present
+    loop:
+
+  - copy:
+      content: |
+        [{{ item.name }}]
+        title={{ item.title | default( item.name ) }}
+        description={{ item.description | default( item.name ) }}
+        ports={% for port in item.ports %}{{ port }}{% if not loop.last %}|{% endif %}{% endfor %}
+      dest: "/etc/ufw/applications.d/{{ item.file | default( item.name ) }}"
+      mode: 0644
+      owner: root
+      group: root
+    loop:
+    - name: dns
+      ports: ["53/udp","53/tcp"]
+    - name: web
+      ports: ["80/tcp","443/tcp"]
+      
+  - ufw:
+      name: "{{ item.app|default(omit) }}"
+      rule: "{{ item.rule|default('allow') }}"
+      src: "{{ item.src|default(omit) }}"
+      dest: "{{ item.dst|default(omit) }}"
+      port: "{{ item.port|default(omit) }}"
+      log: "{{ item.log|default(omit) }}"
+      route: "{{ item.route|default('no') }}"
+      interface: "{{ item.interface|default(omit) }}"
+      direction: "{{ item.direction|default('in') }}"
+      comment: "{{ item.Notes|default(omit) }}"
+    notify: Reload UFW
+    loop:
+    - {interface: "enp0s3", Notes: Vagrant traffic}
+    - {interface: "he-ipv6", route: yes, log: yes, src: "::/0", dst: "{{ interfaces['enp0s8'].ipv6.prefix }}:dead:beef", app: web, Notes: Web Traffic to named host}
+    - {interface: "enp0s8", app: dns, Notes: Allow DNS traffic to DNSMasq}
+    - {interface: "enp0s8", route: yes, app: dns, Notes: Allow DNS traffic through the firewall}
+    - {interface: "enp0s8", src: "0.0.0.0/0", app: OpenSSH, Notes: Allow local OpenSSH management}
+    - {interface: "enp0s8", dst: "224.0.0.0/4", Notes: Multicast Addresses}
+    - {interface: "enp0s8", dst: "255.255.255.255", Notes: Global Broadcast}
+    - {interface: "enp0s8", dst: "{{ interfaces['enp0s8'].ipv4.prefix }}.255", Notes: Local Broadcast}
+    - {rule: deny, route: yes, interface: "he-ipv6", log: yes, src: "::/0", dst: "{{ interfaces['enp0s8'].ipv6.prefix }}:/{{ interfaces['enp0s8'].ipv6.mask|default(64) }}"}
+    - {rule: allow, route: yes, interface: "enp0s8", dst: "::/0", src: "{{ interfaces['enp0s8'].ipv6.prefix }}:/{{ interfaces['enp0s8'].ipv6.mask|default(64) }}"}
+
+  - ufw:
+      policy: allow
+      direction: outgoing
+
+  - ufw:
+      policy: deny
+      direction: incoming
+
+  - ufw:
+      policy: deny
+      direction: routed
+
+  - ufw:
+      logging: on
+
+  - ufw:
+      logging: high
+
+  - ufw:
+      state: enabled
+
+  - apt:
+      name: dnsmasq
+      state: present
+
+  - lineinfile:
+      regexp: '^[#]?conf-dir=/etc/dnsmasq.d\s*$'
+      line: conf-dir=/etc/dnsmasq.d
+      path: /etc/dnsmasq.conf
+    notify: Restart DNSMasq
+
+  - copy:
+      content: |
+         {{ '#' }} Stuff for DNS Resolution
+         domain-needed
+         bogus-priv
+         no-resolv
+         filterwin2k
+         expand-hosts
+         domain=localnet
+         local=/localnet/
+         log-queries
+         {{ '#' }} Global Options
+         interface={{ item.key }}
+         {{ '#' }} DNSv6 - Hurricane Electric Resolver and Google's
+         dhcp-option=option6:dns-server,{{ item.value.ipv6.prefix }}:1
+         {{ '#' }} DNSv4 - Cloudflare
+         server=1.1.1.1
+         server=1.0.0.1
+         {{ '#' }} Global DHCP Options
+         dhcp-leasefile=/run/dnsmasq/dhcp-lease
+         log-dhcp
+         {{ '#' }} DHCPv4 Settings
+         dhcp-range={{ item.value.ipv4.prefix }}.{{ item.value.dhcp.ipv4.pool_start }},{{ item.value.ipv4.prefix }}.{{ item.value.dhcp.ipv4.pool_end }},12h
+         dhcp-option=3,{{ item.value.ipv4.prefix }}.{{ item.value.ipv4.gateway }}
+         {{ '#' }} DHCPv6 Settings
+         enable-ra
+         dhcp-range={{ item.value.ipv6.prefix }}:, slaac, ra-stateless, ra-names
+      dest: "/etc/dnsmasq.d/{{ item.key }}.conf"
+      mode: 0644
+      owner: root
+      group: root
+    loop: "{{ interfaces|dict2items }}"
+    loop_control:
+      label: "{{ item.key }}"
+    when: item.value.dhcp is defined
+    notify: Restart DNSMasq
