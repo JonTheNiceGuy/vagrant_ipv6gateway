@@ -71,7 +71,7 @@
   # SSH
 
   - name: Import the Vagrant SSH Key
-    raw: ssh-keygen -y -f /vagrant/.vagrant/machines/ipv6gateway/virtualbox/private_key
+    raw: "ssh-keygen -y -f /vagrant/.vagrant/machines/{{ inventory_hostname }}/virtualbox/private_key"
     register: vagrant_ssh_key
   - name: Create .ssh
     file:
