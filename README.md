@@ -6,7 +6,7 @@ To use this on YOUR network, configure the following:
 
 1. [Vagrantfile](https://github.com/JonTheNiceGuy/vagrant_ipv6gateway/blob/master/Vagrantfile)
     1. [Line 8](https://github.com/JonTheNiceGuy/vagrant_ipv6gateway/blob/master/Vagrantfile#L8) to define the local IP of your host
-    1. [Line 15)(https://github.com/JonTheNiceGuy/vagrant_ipv6gateway/blob/master/Vagrantfile#L15) to define the IPv4 gateway address on your LAN
+    1. [Line 15](https://github.com/JonTheNiceGuy/vagrant_ipv6gateway/blob/master/Vagrantfile#L15) to define the IPv4 gateway address on your LAN
 1. [site.yml](https://github.com/JonTheNiceGuy/vagrant_ipv6gateway/blob/master/site.yml)
     1. [Line 19](https://github.com/JonTheNiceGuy/vagrant_ipv6gateway/blob/master/site.yml#L19) to define the HE endpoint address to use for your tunnel
     1. [Line 20](https://github.com/JonTheNiceGuy/vagrant_ipv6gateway/blob/master/site.yml#L20) to define the local network endpoint address to use for your tunnel
